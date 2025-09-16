@@ -1,8 +1,7 @@
 # Azure vNet Default Outbound Internet Access Detection Script
 # NoPlaceLike.Cloud
 # Bernhard Flür - Cloud Solutions Architect
-# VERSION: 2.1
-
+# VERSION: 2.2
 
 param(
     [Parameter(Mandatory=$false)]
@@ -25,29 +24,34 @@ param(
 )
 
 function Show-Help {
-    $helpText = $helpText = @"
+    $helpText = @"
 
 ╔══════════════════════════════════════════════════════════════════════════════════╗
 ║                Azure vNet Default Outbound Internet Access Detection             ║
 ╚══════════════════════════════════════════════════════════════════════════════════╝
 
 DESCRIPTION:
-    This PowerShell script identifies Azure virtual networks that are using Default 
-    Outbound internet access. This is crucial for identifying vNets that will be 
-    affected by Azure's deprecation of Default Outbound internet access.
+    This PowerShell script identifies Azure virtual networks that are still using
+    Default Outbound Internet access or are otherwise at risk because they lack
+    an explicit outbound path.
 
-DETECTION CRITERIA:
-    The script identifies subnets meeting these criteria:
-    
-    📌 Criteria 1: Legacy Default Outbound
-       • No User Defined Route (UDR) assigned to subnet
-       • vNet has no NAT Gateway configured
-       • vNet has no Load Balancer configured  
-       • Subnet contains Network Interfaces from Virtual Machines
-    
-    📌 Criteria 2: UDR with Internet Route
-       • UDR assigned with at least one route with destination "0.0.0.0/0"
-       • Subnet contains Network Interfaces from Virtual Machines
+DETECTION CRITERIA (v2.2):
+    A subnet is flagged only if it has VM NICs and NONE of the explicit egress paths exist:
+       • NAT Gateway attached to the subnet, OR
+       • Standard Load Balancer with an OUTBOUND RULE targeting a backend pool that
+         contains NICs from this subnet, OR
+       • Any NIC in the subnet has a Public IP, OR
+       • UDR default route (0.0.0.0/0) to VirtualAppliance or VirtualNetworkGateway.
+
+    Additionally, a subnet is flagged if:
+       • It has a UDR default route (0.0.0.0/0) to Internet AND it does NOT have
+         NAT/LB outbound/PIP (i.e., risky direct Internet UDR).
+
+NOTES:
+    - We explicitly check NIC-level Public IPs.
+    - We differentiate UDR next-hop types (Internet vs Appliance/VNG).
+    - We verify Standard LB OUTBOUND rules (mere backend membership is not enough).
+    - (Optional) We attempt to surface 'defaultOutboundAccess' if the SDK exposes it.
 
 SYNTAX:
     .\DefaultOutboundDetection.ps1 [parameters]
@@ -99,49 +103,48 @@ USAGE EXAMPLES:
     .\DefaultOutboundDetection.ps1 -TenantWide -OutputPath "C:\Reports\TenantDefaultOutbound.csv"
 
 PREREQUISITES:
-    ✅ Azure PowerShell module (Az.Network) installed
+    ✅ Azure PowerShell module (Az) installed
        Install-Module -Name Az -Force
     
     ✅ Authenticated to Azure
        Connect-AzAccount
     
     ✅ Appropriate permissions:
-       • Reader permissions on subscriptions
-       • Network Contributor or equivalent for detailed analysis
+       • Reader (minimum) on subscriptions
+       • Network Reader/Contributor recommended for richer details
 
 OUTPUT FILES:
     📄 Primary Report: [OutputPath] (default: DefaultOutboundVNets.csv)
-       Contains all subnets using Default Outbound internet access
+       Contains all subnets flagged by the criteria
     
     📄 Error Log: [OutputPath]_Errors.csv (if tenant-wide scan encounters errors)
        Contains details of any subscription processing failures
 
 OUTPUT COLUMNS:
-    • SubscriptionId/SubscriptionName    • VNetName/VNetLocation
-    • ResourceGroupName                  • SubnetName/SubnetAddressPrefix  
-    • HasUDR/RouteTableName              • HasInternetRoute
-    • SubnetHasNATGateway                • SubnetHasLoadBalancer
-    • HasVMNICs                          • DefaultOutboundReason
-    • VNetId/SubnetId                   
+    • SubscriptionId/SubscriptionName     • VNetName/VNetLocation
+    • ResourceGroupName                   • SubnetName/SubnetAddressPrefix  
+    • HasUDR/RouteTableName               • HasInternetRoute
+    • UdrDefaultNextHops                  • SubnetHasNATGateway
+    • HasLbOutboundRules                  • HasNicPublicIp
+    • HasVMNICs                           • DefaultOutboundAccess
+    • DefaultOutboundReason               • VNetId/SubnetId                   
 
 MIGRATION PLANNING:
     Use this script to:
-    🎯 Identify vNets affected by Default Outbound deprecation
-    🎯 Plan migration to explicit outbound connectivity methods
-    🎯 Audit current outbound internet access patterns
-    🎯 Generate compliance reports for security reviews
+    🎯 Identify subnets that will lose Internet egress without explicit configuration
+    🎯 Plan migration to NAT Gateway, LB outbound, PIP, or hub firewall
+    🎯 Audit current outbound Internet access patterns
 
 SECURITY CONSIDERATIONS:
-    ⚠️  Default Outbound access provides unrestricted internet egress
-    ⚠️  Azure is deprecating this feature for enhanced security
-    ⚠️  Plan migration to NAT Gateway, Load Balancer, or explicit UDRs
+    ⚠️  Default Outbound access provides unmanaged Internet egress
+    ⚠️  Azure is retiring this behavior for new VNets/subnets (by API version)
+    ⚠️  Plan migration to explicit outbound methods
 
 SUPPORT:
-    For issues or questions about this script, refer to Azure documentation:
-    https://docs.microsoft.com/en-us/azure/virtual-network/ip-services/default-outbound-access
+    See Azure docs on default outbound access:
+    https://learn.microsoft.com/azure/virtual-network/ip-services/default-outbound-access
 
-VERSION: 2.1
-AUTHOR: Azure Network Security Assessment Tool
+VERSION: 2.2
 LAST UPDATED: $(Get-Date -Format 'yyyy-MM-dd')
 
 "@
@@ -167,7 +170,7 @@ if ($ExcludeSubscriptions.Count -gt 0 -and $IncludeSubscriptions.Count -gt 0) {
     exit 1
 }
 
-# Ensure Az.Network
+# Ensure Az module
 if (-not (Get-Module -ListAvailable -Name Az.Network)) {
     Write-Error "Az module not installed. Install-Module -Name Az -Force"
     exit 1
@@ -255,108 +258,174 @@ foreach ($subscription in $subscriptionsToScan) {
             foreach ($subnet in $vNet.Subnets) {
                 Write-Host "    Checking subnet: $($subnet.Name)" -ForegroundColor Gray
 
-                # Determine if subnet has NICs from VMs
-                $hasVMNics = $false
                 $subnetIdNormalized = $subnet.Id.ToLower()
+                $hasVMNics = $false
+                $hasNicWithPublicIp = $false
 
+                # Determine if subnet has NICs from VMs and whether any of those NICs have a PIP
                 if ($subnet.IpConfigurations) {
                     foreach ($ipConfigRef in $subnet.IpConfigurations) {
                         if ($ipConfigRef.Id -match "/networkInterfaces/") {
                             try {
                                 $nicId = ($ipConfigRef.Id -split "/ipConfigurations/")[0]
                                 $nic = Get-AzNetworkInterface -ResourceId $nicId -ErrorAction SilentlyContinue
-                                if ($nic -and $nic.VirtualMachine) {
-                                    $hasVMNics = $true
-                                    break
+                                if ($nic) {
+                                    # VM-backed NIC?
+                                    if ($nic.VirtualMachine) { $hasVMNics = $true }
+
+                                    # Any PIP on NIC?
+                                    if ($nic.IpConfigurations) {
+                                        foreach ($cfg in $nic.IpConfigurations) {
+                                            if ($cfg.PublicIpAddress -and $cfg.PublicIpAddress.Id) {
+                                                $hasNicWithPublicIp = $true
+                                                break
+                                            }
+                                        }
+                                    }
+                                    if ($hasVMNics -and $hasNicWithPublicIp) { break }
                                 }
                             } catch { }
                         }
                     }
                 }
-                if (-not $hasVMNics) { continue }
+                if (-not $hasVMNics) { continue } # Only care about subnets with VM NICs
 
                 # NAT GW on this subnet?
                 $subnetHasNatGateway = $false
-                if ($subnet.NatGateway) { $subnetHasNatGateway = $true }
+                try { if ($subnet.NatGateway) { $subnetHasNatGateway = $true } } catch {}
 
-                # LB association relevant to this subnet? (backend ipConfigs in same subnet)
-                $subnetHasLoadBalancer = $false
-                foreach ($lb in $loadBalancers) {
-                    foreach ($pool in $lb.BackendAddressPools) {
-                        foreach ($ipConfig in ($pool.BackendIpConfigurations | Where-Object { $_ })) {
-                            # Some SDKs expose Subnet on ipConfig, others only the id string
-                            $ipCfgSubnetId = try { $ipConfig.Subnet.Id } catch { $null }
-                            if (-not $ipCfgSubnetId) {
-                                # fall back: infer from ipConfig.Id (points to NIC/ipConfigurations)
-                                try {
-                                    $cfgNicId = ($ipConfig.Id -split "/ipConfigurations/")[0]
-                                    $cfgNic = Get-AzNetworkInterface -ResourceId $cfgNicId -ErrorAction SilentlyContinue
-                                    $ipCfgSubnetId = $cfgNic.IpConfigurations[0].Subnet.Id
-                                } catch { }
-                            }
-                            if ($ipCfgSubnetId -and ($ipCfgSubnetId.ToLower() -eq $subnetIdNormalized)) {
-                                $subnetHasLoadBalancer = $true
-                                break
-                            }
-                        }
-                        if ($subnetHasLoadBalancer) { break }
-                    }
-                    if ($subnetHasLoadBalancer) { break }
-                }
+                # UDR inspection
+                $udrAssigned                = $false
+                $hasInternetRoute           = $false   # 0.0.0.0/0 -> Internet
+                $hasDefaultToApplianceOrVNG = $false   # 0.0.0.0/0 -> VirtualAppliance/VirtualNetworkGateway
+                $routeTableName             = "None"
+                $udrDefaultNextHops         = @()
 
-                # UDR on subnet?
-                $udrAssigned     = $false
-                $hasInternetRoute = $false
-                $routeTableName   = "None"
-
-                if ($subnet.RouteTable) {
+                if ($subnet.RouteTable -and $subnet.RouteTable.Id) {
                     $udrAssigned = $true
-                    try {
-                        $routeTable = Get-AzRouteTable -ResourceId $subnet.RouteTable.Id -ErrorAction Stop
-                        $routeTableName = $routeTable.Name
-                        foreach ($route in $routeTable.Routes) {
-                            if ($route.AddressPrefix -eq "0.0.0.0/0") {
-                                $hasInternetRoute = $true
-                                break
+
+                    # Parse resource group and name from the route table resource ID
+                    $rtId   = $subnet.RouteTable.Id
+                    $rtMatch = [regex]::Match(
+                        $rtId,
+                        "/resourceGroups/(?<rg>[^/]+)/providers/Microsoft\.Network/routeTables/(?<name>[^/]+)",
+                        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+                    )
+
+                    if ($rtMatch.Success) {
+                        $rtRg   = $rtMatch.Groups['rg'].Value
+                        $rtName = $rtMatch.Groups['name'].Value
+                        try {
+                            $routeTable     = Get-AzRouteTable -ResourceGroupName $rtRg -Name $rtName -ErrorAction Stop
+                            $routeTableName = $routeTable.Name
+
+                            foreach ($route in $routeTable.Routes) {
+                                if ($route.AddressPrefix -eq "0.0.0.0/0") {
+                                    $udrDefaultNextHops += $route.NextHopType
+                                    if ($route.NextHopType -eq "Internet") { $hasInternetRoute = $true }
+                                    if ($route.NextHopType -in @("VirtualAppliance","VirtualNetworkGateway")) {
+                                        $hasDefaultToApplianceOrVNG = $true
+                                    }
+                                }
                             }
+                        } catch {
+                            Write-Warning "Could not retrieve route table '$rtName' in RG '$rtRg' for subnet $($subnet.Name): $($_.Exception.Message)"
                         }
-                    } catch {
-                        Write-Warning "Could not retrieve route table details for subnet $($subnet.Name)"
+                    } else {
+                        Write-Warning "Unable to parse RouteTable Id for subnet $($subnet.Name): $rtId"
                     }
                 }
 
-                # Determine criterion
+
+                # Load Balancer outbound rule check (Standard only)
+                $subnetHasLbOutbound = $false
+                if ($loadBalancers) {
+                    foreach ($lb in $loadBalancers) {
+                        try {
+                            if ($lb.Sku.Name -ne 'Standard') { continue }
+
+                            # Find backend pools that include NICs from this subnet
+                            $poolsTouchingSubnet = @()
+                            foreach ($pool in $lb.BackendAddressPools) {
+                                $poolTouches = $false
+                                $backendConfigs = $pool.BackendIpConfigurations | Where-Object { $_ }
+                                foreach ($ipConfig in $backendConfigs) {
+                                    $cfgNicId = ($ipConfig.Id -split "/ipConfigurations/")[0]
+                                    $cfgNic   = Get-AzNetworkInterface -ResourceId $cfgNicId -ErrorAction SilentlyContinue
+                                    if ($cfgNic -and $cfgNic.IpConfigurations -and $cfgNic.IpConfigurations[0].Subnet) {
+                                        $ipCfgSubnetId = $cfgNic.IpConfigurations[0].Subnet.Id
+                                        if ($ipCfgSubnetId -and ($ipCfgSubnetId.ToLower() -eq $subnetIdNormalized)) {
+                                            $poolTouches = $true; break
+                                        }
+                                    }
+                                }
+                                if ($poolTouches) { $poolsTouchingSubnet += $pool.Id }
+                            }
+
+                            if (-not $poolsTouchingSubnet) { continue }
+
+                            # Check LB.OutboundRules reference these pools
+                            $outRules = $lb.OutboundRules | Where-Object { $_ }
+                            foreach ($orule in $outRules) {
+                                $rulePoolId = $orule.BackendAddressPool.Id
+                                if ($rulePoolId -in $poolsTouchingSubnet) { $subnetHasLbOutbound = $true; break }
+                            }
+                            if ($subnetHasLbOutbound) { break }
+                        } catch {
+                            Write-Warning "LB check failed on $($lb.Name): $($_.Exception.Message)"
+                        }
+                    }
+                }
+
+                # Optional: surface defaultOutboundAccess when available
+                $defaultOutboundAccess = $null
+                try { $defaultOutboundAccess = $subnet.DefaultOutboundAccess } catch {}
+
+                # Final classification
+                $hasExplicitEgress =
+                    $subnetHasNatGateway -or
+                    $subnetHasLbOutbound -or
+                    $hasNicWithPublicIp -or
+                    $hasDefaultToApplianceOrVNG
+
+                $atRiskDueToInternetUdr =
+                    $udrAssigned -and $hasInternetRoute -and -not ($subnetHasNatGateway -or $subnetHasLbOutbound -or $hasNicWithPublicIp)
+
                 $meetsDefaultOutboundCriteria = $false
                 $reason = $null
 
-                if (-not $udrAssigned -and -not $subnetHasNatGateway -and -not $subnetHasLoadBalancer -and $hasVMNics) {
-                    $meetsDefaultOutboundCriteria = $true
-                    $reason = "No UDR, no NAT Gateway, no Load Balancer, has VM NICs"
-                }
-                elseif ($udrAssigned -and $hasInternetRoute -and $hasVMNics) {
-                    $meetsDefaultOutboundCriteria = $true
-                    $reason = "UDR with 0.0.0.0/0 route, has VM NICs"
+                if ($hasVMNics) {
+                    if (-not $hasExplicitEgress) {
+                        $meetsDefaultOutboundCriteria = $true
+                        $reason = "No NAT GW/LB outbound/PIP/UDR via Appliance/VNG; has VM NICs"
+                    } elseif ($atRiskDueToInternetUdr) {
+                        $meetsDefaultOutboundCriteria = $true
+                        $reason = "UDR 0.0.0.0/0 -> Internet without NAT/LB outbound/PIP; has VM NICs"
+                    }
                 }
 
                 if ($meetsDefaultOutboundCriteria) {
-                    Write-Host "      ✓ Subnet meets Default Outbound criteria: $reason" -ForegroundColor Green
+                    Write-Host "      ✓ Subnet flagged: $reason" -ForegroundColor Green
                     $results += [PSCustomObject]@{
-                        SubscriptionId        = $subscription.Id
-                        SubscriptionName      = $subscription.Name
-                        ResourceGroupName     = $vNet.ResourceGroupName
-                        VNetName              = $vNet.Name
-                        VNetLocation          = $vNet.Location
-                        SubnetName            = $subnet.Name
-                        SubnetAddressPrefix   = ($subnet.AddressPrefix -join ", ")
-                        HasUDR                = $udrAssigned
-                        RouteTableName        = $routeTableName
-                        HasInternetRoute      = $hasInternetRoute
-                        SubnetHasNATGateway   = $subnetHasNatGateway
-                        SubnetHasLoadBalancer = $subnetHasLoadBalancer
-                        HasVMNICs             = $hasVMNics
-                        DefaultOutboundReason = $reason
-                        VNetId                = $vNet.Id
-                        SubnetId              = $subnet.Id
+                        SubscriptionId         = $subscription.Id
+                        SubscriptionName       = $subscription.Name
+                        ResourceGroupName      = $vNet.ResourceGroupName
+                        VNetName               = $vNet.Name
+                        VNetLocation           = $vNet.Location
+                        SubnetName             = $subnet.Name
+                        SubnetAddressPrefix    = ($subnet.AddressPrefix -join ", ")
+                        HasUDR                 = $udrAssigned
+                        RouteTableName         = $routeTableName
+                        HasInternetRoute       = $hasInternetRoute
+                        UdrDefaultNextHops     = ($udrDefaultNextHops -join ";")
+                        SubnetHasNATGateway    = $subnetHasNatGateway
+                        HasLbOutboundRules     = $subnetHasLbOutbound
+                        HasNicPublicIp         = $hasNicWithPublicIp
+                        HasVMNICs              = $hasVMNics
+                        DefaultOutboundAccess  = $defaultOutboundAccess
+                        DefaultOutboundReason  = $reason
+                        VNetId                 = $vNet.Id
+                        SubnetId               = $subnet.Id
                     }
                 }
             }
@@ -388,7 +457,7 @@ if ($TenantWide) {
 
 Write-Host "Found $($results.Count) subnets in $(
     $results | Select-Object VNetName, SubscriptionId -Unique | Measure-Object | Select-Object -ExpandProperty Count
-) vNet(s) using Default Outbound internet access" -ForegroundColor Green
+) vNet(s) flagged by the criteria" -ForegroundColor Green
 
 if ($results.Count -gt 0) {
     Write-Host "`nSummary by Subscription:" -ForegroundColor Cyan
@@ -413,7 +482,7 @@ if ($results.Count -gt 0) {
     $results | Select-Object -First 10 |
         Format-Table SubscriptionName, VNetName, SubnetName, DefaultOutboundReason, VNetLocation -AutoSize
 } else {
-    Write-Host "`nNo vNets found using Default Outbound internet access." -ForegroundColor Yellow
+    Write-Host "`nNo subnets flagged by the criteria." -ForegroundColor Yellow
     if ($subscriptionErrors.Count -gt 0) {
         Write-Host "Some subscriptions failed; check the error CSV if generated." -ForegroundColor Yellow
     }
